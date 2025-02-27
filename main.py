@@ -562,10 +562,10 @@ def ask_industry_metric(rand: DeterministicRNG, df: pd.DataFrame) -> Optional[Qu
 @click.option("--seed", default=42, help="Seed for random number generation")
 @click.option("--subset", default="subset.csv", help="Subset of files")
 @click.option("--questions", default="questions.json", help="Output file")
-def step2(count: int = 10, seed: int = 42, subset: str = "subset.csv", questions: str = "questions.json"):
+def step2(count: int = 10, seed: int = 42, subset: str = "subset.json", questions: str = "questions.json"):
     rng = DeterministicRNG(seed)
 
-    df = pd.read_csv(subset)
+    df = pd.read_json(subset)
 
     results = []
 
