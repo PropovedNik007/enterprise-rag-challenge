@@ -1,3 +1,9 @@
 .idea
 subset.json
 .envrc
+pdfs/
+processed_pdfs/
+cleanup_pdfs/
+.DS_Store
+../.DS_Store
+processed_pdfs.zip
