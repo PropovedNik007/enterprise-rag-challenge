@@ -3,7 +3,7 @@ import json
 import numpy as np
 import faiss
 import requests
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from sentence_transformers import CrossEncoder
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from typing import Optional, List, Union, Literal
@@ -28,6 +28,40 @@ class AnswerSubmission(BaseModel):
     submission_name: str = Field(..., description="Unique submission name")
     answers: List[Answer] = Field(..., description="List of answers to the questions")
 
+# Helper function: Truncate text to a maximum number of tokens (using whitespace split)
+def truncate_to_max_tokens(text: str, max_tokens: int = 512) -> str:
+    tokens = text.split()
+    if len(tokens) > max_tokens:
+        tokens = tokens[-max_tokens:]  # keep the last max_tokens tokens (or choose first tokens as desired)
+    return " ".join(tokens)
+
+# WatsonX Embedding endpoint helper
+def get_watsonx_embeddings(inputs: List[str], token: str, model_id: str = "ibm/granite-embedding-107m-multilingual") -> np.ndarray:
+    url = "https://rag.timetoact.at/ibm/embeddings"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    # Enforce a 512-token limit on each input
+    max_tokens_limit = 512
+    truncated_inputs = []
+    for inp in inputs:
+        truncated = truncate_to_max_tokens(inp, max_tokens=max_tokens_limit)
+        token_count = len(truncated.split())
+        print(f"Original input token count: {len(inp.split())}, truncated token count: {token_count}")
+        print(f"Truncated snippet: {truncated[:100]}...")
+        truncated_inputs.append(truncated)
+
+    payload = {
+        "inputs": truncated_inputs,
+        "model_id": model_id
+    }
+    print("Payload being sent to WatsonX:", payload)
+    response = requests.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+    data = response.json()
+    embeddings = np.array(data.get("embeddings"))
+    return embeddings
 
 # Functions to load and process PDF JSON pages
 def load_pdf_json(folder_path):
@@ -69,33 +103,31 @@ def get_page_content(doc):
             content += " " + caption + " " + ocr_text
     return content
 
-def build_vector_db(documents, model):
+def build_vector_db(documents, watson_token):
     """
     Build a FAISS vector index for the document pages using cosine similarity.
-    Embeddings are normalized, and we use an inner product index.
+    Uses WatsonX embeddings.
     """
     contents = [get_page_content(doc) for doc in documents]
-    embeddings = model.encode(contents, convert_to_numpy=True)
-    # Normalize embeddings to unit vectors for cosine similarity
+    embeddings = get_watsonx_embeddings(contents, watson_token)
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    embeddings = embeddings / norms
+    embeddings = embeddings / norms  # Normalize embeddings
     dimension = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dimension)  # Inner product for cosine similarity
+    index = faiss.IndexFlatIP(dimension)
     index.add(embeddings)
     return index, documents, contents
 
 # --- Dense retrieval and re-ranking using CrossEncoder ---
-def dense_retrieve(query: str, dense_model, index, documents, top_k: int = 20):
+def dense_retrieve(query: str, watson_token: str, index, documents, top_k: int = 20):
     """
-    Retrieve top_k candidates using the dense model and FAISS index.
+    Retrieve top_k candidates using WatsonX embeddings and the FAISS index.
     Returns a list of (document, dense_score) tuples.
     """
-    query_embedding = dense_model.encode([query], convert_to_numpy=True)
+    query_embedding = get_watsonx_embeddings([query], watson_token)
     query_embedding = query_embedding / np.linalg.norm(query_embedding, axis=1, keepdims=True)
     scores, indices = index.search(query_embedding, top_k)
     candidates = []
     for score, idx in zip(scores[0], indices[0]):
-        # Only consider candidates with sufficient content length
         candidate = documents[idx]
         content = get_page_content(candidate)
         if len(content.split()) < 10:
@@ -110,16 +142,15 @@ def rerank_candidates(query: str, candidates: List, cross_encoder: CrossEncoder)
     """
     if not candidates:
         return None
-    # Build pairs (query, candidate content)
     pairs = [(query, get_page_content(doc)) for doc, _ in candidates]
     rerank_scores = cross_encoder.predict(pairs)
     best_idx = int(np.argmax(rerank_scores))
     return candidates[best_idx][0]
 
 # Updated process_question using two-stage retrieval
-def process_question(question: Question, dense_model, dense_index, documents, cross_encoder, watson_token):
-    # Stage 1: Dense retrieval
-    candidates = dense_retrieve(question.text, dense_model, dense_index, documents, top_k=20)
+def process_question(question: Question, watson_token: str, dense_index, documents, cross_encoder, generation_token):
+    # Stage 1: Dense retrieval using WatsonX embeddings
+    candidates = dense_retrieve(question.text, watson_token, dense_index, documents, top_k=20)
     # Stage 2: Re-rank candidates using CrossEncoder
     best_candidate = rerank_candidates(question.text, candidates, cross_encoder)
     if best_candidate is None:
@@ -128,7 +159,9 @@ def process_question(question: Question, dense_model, dense_index, documents, cr
         references = []
     else:
         context = get_page_content(best_candidate)
-        text_response = call_text_generation(question.text, question.kind, context, watson_token)
+        # Truncate context to 512 tokens (limit per query)
+        context = truncate_to_max_tokens(context, max_tokens=512)
+        text_response = call_text_generation(question.text, question.kind, context, generation_token)
         print("Text generation response:", text_response)
         results = text_response.get("results")
         if results and isinstance(results, list) and len(results) > 0:
@@ -142,16 +175,19 @@ def process_question(question: Question, dense_model, dense_index, documents, cr
         references = [SourceReference(pdf_sha1=pdf_sha1, page_index=page_index)]
     return answer_val, references
 
-def call_text_generation(query, question_type, context, watson_token):
+def call_text_generation(query, question_type, context, generation_token):
     """
-    Call the text generation API, augmenting the question with context.
+    Call the text generation API (using deepseek here),
+    augmenting the question with context.
     """
     text_generation_url = "https://rag.timetoact.at/ibm/text_generation"
     headers = {
-        "Authorization": f"Bearer {watson_token}",
+        "Authorization": f"Bearer {generation_token}",
         "Content-Type": "application/json"
     }
     augmented_query = f"Context: {context}\n question: {query} question_type: {question_type}"
+    # Truncate the augmented query to 512 tokens as well
+    augmented_query = truncate_to_max_tokens(augmented_query, max_tokens=512)
     print("Augmented query:", augmented_query)
     payload = {
         "input": [
@@ -164,27 +200,23 @@ def call_text_generation(query, question_type, context, watson_token):
             "min_new_tokens": 1
         }
     }
-    response = requests.post(text_generation_url, headers=headers, json=payload)
+    response = requests.post(text_generation_url, headers=headers, json=payload, verify=False)
     response.raise_for_status()
     return response.json()
 
-def process_questions(questions_file: str, folder_path: str, watson_token: str, team_email: str,
+def process_questions(questions_file: str, folder_path: str, watson_token: str, generation_token: str, team_email: str,
                       submission_name: str) -> AnswerSubmission:
     with open(questions_file, 'r') as f:
         questions_json = json.load(f)
     questions = [Question(**q) for q in questions_json]
 
     documents = load_pdf_json(folder_path)
-    # Use a stronger dense model if possible (e.g., 'all-mpnet-base-v2')
-    dense_model = SentenceTransformer('all-MiniLM-L6-v2')
-    # dense_model = SentenceTransformer('all-mpnet-base-v2')
-    dense_index, docs, _ = build_vector_db(documents, dense_model)
-    # Initialize CrossEncoder for re-ranking (using a MS Marco model)
+    dense_index, docs, _ = build_vector_db(documents, watson_token)
     cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
 
     answers = []
     for q in questions:
-        value, refs = process_question(q, dense_model, dense_index, documents, cross_encoder, watson_token)
+        value, refs = process_question(q, watson_token, dense_index, documents, cross_encoder, generation_token)
         if q.kind == "number":
             try:
                 cleaned = value.replace(",", "").replace(" ", "")
@@ -222,11 +254,13 @@ if __name__ == "__main__":
     load_dotenv()
     folder_path = "jsons"
     questions_file = "questions.json"
+
     watson_token = os.getenv("MY_SECRET_KEY", "YOUR_WATSON_TOKEN")
+    generation_token = os.getenv("MY_SECRET_KEY", "YOUR_WATSON_TOKEN")
     team_email = "markdrozdov0@gmail.com"
     submission_name = "experiment_01"
 
-    submission = process_questions(questions_file, folder_path, watson_token, team_email, submission_name)
+    submission = process_questions(questions_file, folder_path, watson_token, generation_token, team_email, submission_name)
     print(submission)
 
     with open("answer_submission.json", "w") as f:
